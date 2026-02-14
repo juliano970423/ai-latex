@@ -1,0 +1,74 @@
+name: Compile LaTeX
+
+on:
+  repository_dispatch:
+    types: [compile-latex]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 缓存辅助文件（增量编译）
+      - name: Cache LaTeX auxiliary files
+        uses: actions/cache@v4
+        with:
+          path: |
+            *.aux
+            *.toc
+            *.lof
+            *.lot
+            *.bbl
+            *.blg
+            *.out
+            *.fls
+            *.fdb_latexmk
+            .auxiliary
+            **/.auxiliary
+          key: latex-aux-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            latex-aux-${{ github.ref }}-
+
+      # 创建辅助文件目录
+      - name: Create auxiliary directory
+        run: |
+          project_path="${{ github.event.client_payload.project_path }}"
+          if [ -n "$project_path" ]; then
+            dir_name=$(dirname "$project_path")
+            mkdir -p "$dir_name/.auxiliary"
+          else
+            mkdir -p .auxiliary
+          fi
+
+      # 编译LaTeX
+      - name: Compile with ${{ github.event.client_payload.compiler || 'latexmk' }}
+        uses: xu-cheng/latex-action@v4
+        with:
+          working_directory: ${{ github.event.client_payload.project_path || '.' }}
+          root_file: ${{ github.event.client_payload.root_file || 'main.tex' }}
+          compiler: ${{ github.event.client_payload.compiler || 'latexmk' }}
+          args: -pdf -interaction=nonstopmode -synctex=1 -aux-directory=.auxiliary
+      
+      # 上传编译产物
+      - name: Upload compiled PDF and SyncTeX
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-output-${{ github.run_id }}
+          path: |
+            ${{ github.event.client_payload.project_path || '.' }}/*.pdf
+            ${{ github.event.client_payload.project_path || '.' }}/*.synctex.gz
+          retention-days: 7
+
+      # 上传编译日志（如果有错误）
+      - name: Upload compilation log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compilation-log-${{ github.run_id }}
+          path: |
+            ${{ github.event.client_payload.project_path || '.' }}/*.log
+          retention-days: 7
