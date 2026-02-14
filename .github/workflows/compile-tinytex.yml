@@ -1,0 +1,220 @@
+name: Compile LaTeX (TinyTeX)
+
+on:
+  repository_dispatch:
+    types: [compile-tinytex]
+  workflow_dispatch
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 使用官方 setup-tinytex action 安裝 TinyTeX
+      - name: Install TinyTeX
+        uses: r-lib/actions/setup-tinytex@v2
+        env:
+          # 安裝預編譯版本，不需要每次重新安裝
+          TINYTEX_INSTALLER: TinyTeX
+          # 不更新 tlmgr，避免跨版本更新問題
+          TINYTEX_ACTION: install-only
+
+      # 安裝核心 LaTeX 包（模板需要的 ctex）
+      - name: Install core LaTeX packages
+        run: |
+          tlmgr install ctex
+
+      # 缓存辅助文件（增量编译）
+      - name: Cache LaTeX auxiliary files
+        uses: actions/cache@v4
+        with:
+          path: |
+            *.aux
+            *.toc
+            *.lof
+            *.lot
+            *.bbl
+            *.blg
+            *.out
+            *.fls
+            *.fdb_latexmk
+            .auxiliary
+            **/.auxiliary
+          key: latex-aux-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            latex-aux-${{ github.ref }}-
+
+      # 创建辅助文件目录
+      - name: Create auxiliary directory
+        run: |
+          project_path="${{ github.event.client_payload.project_path }}"
+          if [ -n "$project_path" ]; then
+            dir_name=$(dirname "$project_path")
+            mkdir -p "$dir_name/.auxiliary"
+          else
+            mkdir -p .auxiliary
+          fi
+
+      # 编译 LaTeX（带自动包安装）
+      - name: Compile with auto package installation
+        run: |
+          # 获取编译参数
+          project_path="${{ github.event.client_payload.project_path || '.' }}"
+          root_file="${{ github.event.client_payload.root_file || 'main.tex' }}"
+          compiler="${{ github.event.client_payload.compiler || 'xelatex' }}"
+          
+          # 进入工作目录
+          cd "$project_path"
+          
+          # 创建包配置目录
+          mkdir -p .tinytex
+          packages_file=".tinytex/packages.txt"
+          touch "$packages_file"
+          
+          # 函数：检查是否是缺失包错误
+          is_missing_package_error() {
+            local log_file="$1"
+            # 检查常见的缺失包错误模式
+            grep -q "! LaTeX Error: File .*\.sty' not found" "$log_file" && return 0
+            grep -q "! LaTeX Error: File .*\.cls' not found" "$log_file" && return 0
+            grep -q "! Font .* not loadable" "$log_file" && return 0
+            grep -q "No file .*\.fd$" "$log_file" && return 0
+            grep -q "! Package .* Error: Unknown option" "$log_file" && return 0
+            grep -q "! LaTeX Error: .* cannot be found" "$log_file" && return 0
+            return 1
+          }
+          
+          # 函数：从日志中提取缺失的文件
+          extract_missing_files() {
+            local log_file="$1"
+            # 提取 .sty 文件
+            grep -o "File '[^']*\.sty'" "$log_file" | sed "s/File '\|'//g" | sort -u
+            # 提取 .cls 文件
+            grep -o "File '[^']*\.cls'" "$log_file" | sed "s/File '\|'//g" | sort -u
+            # 提取 .fd 文件
+            grep -o "No file [^ ]*\.fd" "$log_file" | sed "s/No file //" | sort -u
+          }
+          
+          # 函数：執行編譯
+          compile_latex() {
+            if [ "$compiler" = "latexmk" ]; then
+              latexmk -pdf -interaction=nonstopmode -synctex=1 -aux-directory=.auxiliary "$root_file"
+            elif [ "$compiler" = "pdflatex" ]; then
+              pdflatex -interaction=nonstopmode -synctex-1 -output-directory=.auxiliary "$root_file"
+            elif [ "$compiler" = "xelatex" ]; then
+              xelatex -interaction=nonstopmode -synctex-1 -output-directory=.auxiliary "$root_file"
+            else
+              echo "Unknown compiler: $compiler"
+              return 1
+            fi
+          }
+          
+          # 函數：安裝缺失的包
+          install_missing_packages() {
+            local log_file="$1"
+            local missing_files=$(extract_missing_files "$log_file")
+            local packages_to_install=""
+            
+            for file in $missing_files; do
+              # 跳過已經在已安裝列表中的
+              if ! grep -q "^${file}$" "$packages_file"; then
+                # 搜索包含該文件的包
+                pkg=$(tlmgr search --global --file "$file" 2>/dev/null | head -1 | awk '{print $1}')
+                if [ -n "$pkg" ] && [ "$pkg" != "tlmgr" ]; then
+                  packages_to_install="$packages_to_install $pkg"
+                  # 記錄文件名
+                  echo "$file" >> "$packages_file"
+                fi
+              fi
+            done
+            
+            # 安裝找到的包
+            if [ -n "$packages_to_install" ]; then
+              echo "Installing packages:$packages_to_install"
+              tlmgr install $packages_to_install
+              return 0
+            fi
+            return 1
+          }
+          
+          # 主編譯循環
+          max_attempts=5
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Compilation attempt $attempt of $max_attempts"
+            
+            # 執行編譯
+            if compile_latex; then
+              echo "Compilation successful!"
+              break
+            fi
+            
+            # 檢查日誌文件
+            log_file=".auxiliary/${root_file%.tex}.log"
+            if [ ! -f "$log_file" ]; then
+              echo "Log file not found: $log_file"
+              exit 1
+            fi
+            
+            # 判斷是否是缺失包錯誤
+            if is_missing_package_error "$log_file"; then
+              echo "Missing package error detected"
+              
+              # 嘗試安裝缺失的包
+              if install_missing_packages "$log_file"; then
+                echo "Packages installed, retrying..."
+                attempt=$((attempt + 1))
+                continue
+              else
+                echo "Could not determine which packages to install"
+                exit 1
+              fi
+            else
+              echo "Not a missing package error (likely syntax error)"
+              echo "First error in log:"
+              grep -A 5 "^!" "$log_file" | head -10
+              exit 1
+            fi
+          done
+          
+          # 檢查是否成功
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed after $max_attempts attempts"
+            exit 1
+          fi
+          
+          # 將生成的文件複製到根目錄
+          if [ -f ".auxiliary/${root_file%.tex}.pdf" ]; then
+            cp ".auxiliary/${root_file%.tex}.pdf" "${root_file%.tex}.pdf"
+          fi
+          if [ -f ".auxiliary/${root_file%.tex}.synctex.gz" ]; then
+            cp ".auxiliary/${root_file%.tex}.synctex.gz" "${root_file%.tex}.synctex.gz"
+          fi
+          
+          echo "Compilation completed successfully"
+
+      # 上传编译产物
+      - name: Upload compiled PDF and SyncTeX
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-output-${{ github.run_id }}
+          path: |
+            ${{ github.event.client_payload.project_path || '.' }}/*.pdf
+            ${{ github.event.client_payload.project_path || '.' }}/*.synctex.gz
+          retention-days: 7
+
+      # 上传编译日志和包配置（如果有错误）
+      - name: Upload compilation log and package config
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compilation-log-${{ github.run_id }}
+          path: |
+            ${{ github.event.client_payload.project_path || '.' }}/*.log
+            ${{ github.event.client_payload.project_path || '.' }}/.auxiliary/*.log
+            ${{ github.event.client_payload.project_path || '.' }}/.tinytex/
+          retention-days: 7
